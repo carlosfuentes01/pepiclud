@@ -1,0 +1,55 @@
+name: pepicloud
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PG_REPL_USER: ${PG_REPL_USER}
+      PG_REPL_PASSWORD: ${PG_REPL_PASSWORD}
+    # wal_level=replica + summarize_wal=on => habilita backups incrementales nativos (PG17)
+    command: ["postgres", "-c", "wal_level=replica", "-c", "summarize_wal=on", "-c", "max_wal_senders=5"]
+    volumes:
+      - pg_data:/var/lib/postgresql/data          # datos en operación
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      retries: 20
+
+  localstack:
+    image: localstack/localstack:4.14
+    environment:
+      SERVICES: s3
+      LOCALSTACK_AUTH_TOKEN: ${LOCALSTACK_AUTH_TOKEN:-}
+      BUCKET_PRIMARY: ${BUCKET_PRIMARY}
+      BUCKET_SECONDARY: ${BUCKET_SECONDARY}
+      BUCKET_BACKUP: ${BUCKET_BACKUP}
+    volumes:
+      - ./localstack/init-s3.sh:/etc/localstack/init/ready.d/init-s3.sh:ro
+    ports:
+      - "4566:4566"
+    healthcheck:
+      test: ["CMD-SHELL", "awslocal s3api head-bucket --bucket $${BUCKET_BACKUP}"]
+      interval: 5s
+      retries: 30
+
+  app:
+    build: ./app
+    env_file: .env            # credenciales y claves solo en tiempo de ejecución
+    environment:
+      PGHOST: postgres
+      BACKUP_DIR: /backups
+    volumes:
+      - pg_backups:/backups   # respaldos fuera del volumen de datos de PostgreSQL
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres: { condition: service_healthy }
+      localstack: { condition: service_healthy }
+
+volumes:
+  pg_data:
+  pg_backups:
