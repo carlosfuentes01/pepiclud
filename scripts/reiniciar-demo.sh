@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Deja PepiCloud en estado limpio y consistente para la demostración:
 # borra volúmenes (BD + respaldos), levanta todo y carga los datos de prueba.
-# Úsalo también si Docker/LocalStack se reinició: LocalStack (edición gratuita) guarda S3 en memoria.
+# Con MinIO los datos persisten entre reinicios: este script solo hace falta para empezar de cero.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 docker compose down -v

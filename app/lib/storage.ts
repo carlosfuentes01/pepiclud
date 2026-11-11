@@ -1,4 +1,4 @@
-// Acceso al almacenamiento de objetos (LocalStack S3). Todos los objetos se escriben con
+// Acceso al almacenamiento de objetos (MinIO, compatible con S3). Todos los objetos se escriben con
 // Object Lock en modo COMPLIANCE: ni siquiera el administrador/root puede borrar ni acortar la retención.
 import {
   S3Client,

@@ -22,8 +22,8 @@ export const config = {
     return {
       endpoint: req("S3_ENDPOINT"),
       region: req("AWS_REGION"),
-      accessKeyId: req("AWS_ACCESS_KEY_ID"),
-      secretAccessKey: req("AWS_SECRET_ACCESS_KEY"),
+      accessKeyId: req("S3_ACCESS_KEY"),
+      secretAccessKey: req("S3_SECRET_KEY"),
     };
   },
   get buckets() {

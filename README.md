@@ -1,19 +1,24 @@
 # PepiCloud – Prototipo de gestión documental distribuida (Taller Práctico 2)
 
+> **Rama `minio`.** Esta versión usa **MinIO** (con persistencia en disco) en lugar de LocalStack.
+> El enunciado nombra LocalStack como tecnología base, así que la versión original queda en la etiqueta `v1-localstack`
+> (rama `main`). Ver [Versiones](#versiones) para cambiar entre ambas.
+
 Prototipo on-premise, a escala, del flujo de gestión documental de PepiCloud: recepción, cifrado, almacenamiento redundante,
 consulta, recuperación ante fallos, inmutabilidad y respaldo/restauración de la base de datos.
 
 ## Arquitectura
 
-Tres contenedores (Docker Compose):
+Tres contenedores de servicio más uno de inicialización (Docker Compose):
 
 | Servicio | Imagen | Función |
 |---|---|---|
 | `app` | build propio (Node 22 + Next.js 15 + binarios PostgreSQL 17) | Monolito en capas: interfaz web + API REST + servicios. Ejecuta los backups de PostgreSQL. Puerto **3000**. |
 | `postgres` | `postgres:17` | Información estructurada (personas, tipos, metadatos, referencias). `wal_level=replica`, `summarize_wal=on`. |
-| `localstack` | `localstack/localstack:4.14` | S3 local con 3 buckets independientes, versionado + **Object Lock**. |
+| `minio` | `cgr.dev/chainguard/minio` (MinIO RELEASE.2026-09-22) | Almacenamiento de objetos compatible con S3, **persistente** (volumen `minio_data`): 3 buckets independientes con versionado + **Object Lock**. Consola web en http://localhost:9011. |
+| `minio-init` | `cgr.dev/chainguard/minio-client` | Se ejecuta una vez: crea los buckets con Object Lock y el usuario propio de la app (la app no usa las credenciales de administrador). |
 
-Volúmenes: `pg_data` (datos en operación) y `pg_backups` (respaldos, **separado** del volumen de datos).
+Volúmenes: `pg_data` (datos en operación), `pg_backups` (respaldos, **separado** del volumen de datos) y `minio_data` (objetos).
 
 ```
 Navegador ──HTTP 3000──▶ app (Next.js)
@@ -24,9 +29,9 @@ Navegador ──HTTP 3000──▶ app (Next.js)
                           ├─ lib/storage.ts        Integración S3 (Object Lock)
                           ├─ lib/backup.ts         Backups PG (pg_basebackup / pg_combinebackup)
                           └─ lib/db.ts             Acceso a datos (pg)
-                               │ SQL 5432                    │ S3 4566
+                               │ SQL 5432                    │ S3 9000
                                ▼                             ▼
-                          postgres (pg_data)        localstack: pepi-primary | pepi-secondary | pepi-backup
+                          postgres (pg_data)        minio (minio_data): pepi-primary | pepi-secondary | pepi-backup
                                ▲ replicación (pg_basebackup)
                           volumen pg_backups (full + incrementales)
 ```
@@ -61,7 +66,7 @@ El enunciado del Taller 2 no exige separarlos, y así se reduce el número de co
 | Integridad | AES-GCM autentica el contenido y además se compara el SHA-256. Si alguien sobrescribe un objeto directamente en S3, esa copia se descarta y se usa otra. |
 | Cifrado en reposo | AES-256-GCM en la app **antes** de subir (clave `ENCRYPTION_KEY`). En S3 solo hay texto cifrado; el IV y el tag se guardan en PostgreSQL. |
 | Secretos fuera del código y de las imágenes | Todo sale de `.env` (no versionado, excluido por `.dockerignore`) y se inyecta en tiempo de ejecución (`env_file`). El script de evidencias busca los secretos en el código, en `docker history` y en `docker inspect`. |
-| Inmutabilidad de 30 min (incluso para admin) | Cada objeto se escribe con `ObjectLockMode=COMPLIANCE` y `RetainUntilDate = ahora + 30 min`. **El backend no filtra por tiempo**: siempre intenta el borrado real en S3, y S3 responde `AccessDenied`. Tampoco se puede acortar la retención ni borrar con `--bypass-governance-retention`, ni siquiera con las credenciales raíz. |
+| Inmutabilidad de 30 min (incluso para admin) | Cada objeto se escribe con `ObjectLockMode=COMPLIANCE` y `RetainUntilDate = ahora + 30 min`. **El backend no filtra por tiempo**: siempre intenta el borrado real en S3, y MinIO lo rechaza (`Object is WORM protected and cannot be overwritten`). Tampoco se puede cambiar o acortar la retención ni borrar con `--bypass`, ni siquiera con las credenciales de administrador de MinIO. |
 | Eliminación tras la retención | Requiere el token de administrador (`ADMIN_TOKEN`, el permiso establecido). Borra todas las versiones en los 3 buckets y marca `deleted_at`. |
 | Modificación | Durante la retención, `PUT /api/documents/:id` intenta cambiar la protección en S3, S3 lo rechaza y la API devuelve 403. Pasada la retención, permite reemplazar el contenido (nuevas versiones con nueva retención). |
 | Backup PG completo + incrementales | `pg_basebackup` (completo) y `pg_basebackup --incremental` (**backup incremental nativo de PostgreSQL 17**, basado en el resumen de WAL `summarize_wal`). Cada incremental contiene solo los bloques cambiados desde el backup anterior de la cadena. |
@@ -88,11 +93,29 @@ python3 scripts/datos_prueba.py
 
 Abre **http://localhost:3000**. Para reiniciar desde cero: `docker compose down -v && docker compose up -d`.
 
-> **LocalStack**: desde marzo de 2026 la imagen `latest` exige `LOCALSTACK_AUTH_TOKEN`. Este proyecto fija la etiqueta `4.14`,
-> que funciona sin token. Si usas otra versión, pon tu token gratuito en `.env`.
+> **Persistencia**: los objetos viven en el volumen `minio_data`, así que sobreviven a `docker compose down`/`up` y a reinicios
+> del equipo. Solo `docker compose down -v` (o `./scripts/reiniciar-demo.sh`) borra todo.
 >
-> **Persistencia de LocalStack**: la edición comunitaria guarda S3 en memoria. Si reinicias solo el contenedor `localstack`,
-> se pierden los objetos mientras PostgreSQL conserva las referencias. Para empezar de cero usa `docker compose down -v`.
+> **Imagen de MinIO**: desde fines de 2025 MinIO dejó de publicar imágenes oficiales de la edición comunitaria; se usa la
+> compilación de Chainguard (`cgr.dev/chainguard/minio`, gratuita, etiqueta `latest`).
+>
+> **Credenciales**: `MINIO_ROOT_*` (administrador) solo las usan `minio-init` y las pruebas; la app usa `S3_ACCESS_KEY`/`S3_SECRET_KEY`.
+> Úsalas sin `@`, `:` ni `/`, porque van dentro de una URL.
+
+## Versiones
+
+| Versión | Dónde | Almacenamiento |
+|---|---|---|
+| Original (cumple la tecnología base del enunciado) | etiqueta `v1-localstack` / rama `main` | LocalStack 4.14 (sin persistencia) |
+| Alternativa con persistencia | rama `minio` | MinIO |
+
+Para cambiar de versión (el mismo `.env` sirve para ambas):
+
+```bash
+docker compose down -v            # los datos de una versión no sirven para la otra
+git checkout main                 # o: git checkout minio
+./scripts/reiniciar-demo.sh       # levanta todo y carga los datos de prueba
+```
 
 ## Backups y restauración de PostgreSQL
 
@@ -147,7 +170,7 @@ Cada ejecución queda registrada en `evidencias/evidencias_<fecha>.log`.
 
 ## Limitaciones conocidas (prototipo académico)
 
-- Las 3 ubicaciones S3 son buckets independientes dentro de **una** instancia LocalStack. En producción irían en nodos físicos distintos (Taller 1).
+- Las 3 ubicaciones S3 son buckets independientes dentro de **una** instancia MinIO. En producción irían en nodos físicos distintos (Taller 1); MinIO permite desplegarlo distribuido o replicar entre sitios.
 - La "pérdida" de una copia se provoca con un delete marker real. Destruir la versión bloqueada es imposible por diseño: eso es justamente lo que garantiza el Object Lock.
 - No hay autenticación de usuarios. El permiso de eliminación se modela con un token de administrador.
-- El cifrado lo hace la aplicación, porque el SSE de LocalStack no cifra realmente los datos en disco.
+- El cifrado lo hace la aplicación (AES-256-GCM), así la clave nunca llega al almacenamiento.

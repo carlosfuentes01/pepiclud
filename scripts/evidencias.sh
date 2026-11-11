@@ -16,9 +16,10 @@ h()    { echo; echo "================ $* ================"; }
 ok()   { echo "  [OK]    $*"; PASS=$((PASS+1)); }
 bad()  { echo "  [FALLO] $*"; FAIL=$((FAIL+1)); }
 check(){ if [ "$1" = "$2" ]; then ok "$3 (=$2)"; else bad "$3 (esperado $2, obtenido $1)"; fi; }
-s3()   { docker compose exec -T localstack awslocal "$@"; }
+# Cliente MinIO (mc) con credenciales de ADMINISTRADOR (alias "pepi"), sin pasar por la app
+mc_()  { docker compose run --rm -T --no-deps --entrypoint mc minio-init "$@"; }
 psql_(){ docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -At -c "$1"; }
-denied(){ local o; o=$(s3 "$@" 2>&1); echo "    -> ${o//$'\n'/ }"; [[ "$o" == *AccessDenied* ]]; }
+denied(){ local o; o=$(mc_ "$@" 2>&1); echo "    -> ${o//$'\n'/ }"; [[ "$o" == *"WORM protected"* || "$o" == *AccessDenied* ]]; }
 code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
 served(){ curl -s -D - -o "$TMP/dl.bin" "$B/api/documents/$1/download" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-served-from"{print $2}'; }
 TMP=$(mktemp -d)
@@ -30,7 +31,7 @@ if [ "${1:-}" = "post" ]; then
   check "$(code -X DELETE -H 'x-admin-token: x' "$B/api/documents/$ID")" 401 "Eliminar sin permiso de administrador es rechazado"
   check "$(code -X DELETE -H "x-admin-token: $ADMIN_TOKEN" "$B/api/documents/$ID")" 200 "Administrador elimina el documento tras la retención"
   for b in "$BUCKET_PRIMARY" "$BUCKET_SECONDARY" "$BUCKET_BACKUP"; do
-    n=$(s3 s3api list-object-versions --bucket "$b" --prefix "persons/" --query "length(Versions[?contains(Key,'$ID')] || \`[]\`)" --output text)
+    n=$(mc_ ls --versions --recursive "pepi/$b/persons/" | grep -c "$ID")
     check "$n" 0 "Versiones restantes en $b"
   done
   echo; echo "RESULTADO: $PASS OK, $FAIL fallos"; exit $FAIL
@@ -56,11 +57,11 @@ check "$(psql_ "select count(*) from information_schema.columns where table_sche
 
 h "3. Cifrado en reposo"
 echo "  Primeros bytes del objeto almacenado en $BUCKET_PRIMARY:"
-s3 s3 cp "s3://$BUCKET_PRIMARY/$KEY" - > "$TMP/raw.bin"
+mc_ cat "pepi/$BUCKET_PRIMARY/$KEY" > "$TMP/raw.bin"
 xxd "$TMP/raw.bin" | head -3
 if grep -q "CONFIDENCIAL" "$TMP/raw.bin"; then bad "El objeto almacenado contiene texto plano"; else ok "El objeto almacenado no contiene el texto original"; fi
 for b in "$BUCKET_SECONDARY" "$BUCKET_BACKUP"; do
-  s3 s3 cp "s3://$b/$KEY" - > "$TMP/raw_$b.bin"
+  mc_ cat "pepi/$b/$KEY" > "$TMP/raw_$b.bin"
   if grep -q CONFIDENCIAL "$TMP/raw_$b.bin"; then bad "Texto plano en $b"; else ok "Objeto cifrado en $b"; fi
 done
 
@@ -72,7 +73,7 @@ check "$(sha256sum < "$TMP/dl.bin" | cut -d' ' -f1)" "$(sha256sum < "$TMP/inform
 
 h "5. Disponibilidad: pérdida de la copia primary"
 curl -s -X POST "$B/api/documents/$ID/simulate-loss/primary"; echo
-s3 s3api get-object --bucket "$BUCKET_PRIMARY" --key "$KEY" "/tmp/x" 2>&1 | grep -o "NoSuchKey.*" | head -1
+mc_ cat "pepi/$BUCKET_PRIMARY/$KEY" 2>&1 | grep -o "Object does not exist.*" | head -1
 for i in 1 2; do check "$(served "$ID")" secondary "Descarga $i con primary perdida"; done
 
 h "6. Disponibilidad: pérdida de AMBAS copias operativas -> backup"
@@ -85,28 +86,28 @@ S=$(served "$ID"); [ "$S" = primary ] || [ "$S" = secondary ] && ok "Copias repa
 
 h "7. Integridad: alteración directa del objeto en S3 (sin pasar por la app)"
 echo "contenido falso" > "$TMP/fake.txt"
-s3 s3 cp - "s3://$BUCKET_SECONDARY/$KEY" < "$TMP/fake.txt" >/dev/null
+mc_ pipe "pepi/$BUCKET_SECONDARY/$KEY" < "$TMP/fake.txt" >/dev/null
 echo "  (se sobrescribió la clave en $BUCKET_SECONDARY: S3 crea una NUEVA versión; la original bloqueada permanece)"
 for i in 1 2; do S=$(served "$ID"); [ "$S" = primary ] && ok "Descarga $i servida desde primary (copia alterada descartada por GCM/SHA-256)" || bad "Descarga $i servida desde $S"; done
 VORIG=$(psql_ "select version_id from document_locations where document_id='$ID' and role='secondary'")
-s3 s3api get-object --bucket "$BUCKET_SECONDARY" --key "$KEY" --version-id "$VORIG" "/tmp/orig.bin" >/dev/null && ok "La versión original sigue existiendo en $BUCKET_SECONDARY"
+mc_ cat --version-id "$VORIG" "pepi/$BUCKET_SECONDARY/$KEY" >/dev/null && ok "La versión original sigue existiendo en $BUCKET_SECONDARY"
 
 h "8. Inmutabilidad ANTES de los ${RETENTION_MINUTES} minutos"
-s3 s3api head-object --bucket "$BUCKET_PRIMARY" --key "$KEY" --query '[ObjectLockMode,ObjectLockRetainUntilDate]' --output text
+mc_ retention info "pepi/$BUCKET_PRIMARY/$KEY"
 check "$(code -X DELETE -H "x-admin-token: $ADMIN_TOKEN" "$B/api/documents/$ID")" 403 "App: eliminación por administrador rechazada"
 curl -s -X DELETE -H "x-admin-token: $ADMIN_TOKEN" "$B/api/documents/$ID"; echo
 check "$(code -X PUT -H "x-admin-token: $ADMIN_TOKEN" "$B/api/documents/$ID")" 403 "App: modificación por administrador rechazada"
 VP=$(psql_ "select version_id from document_locations where document_id='$ID' and role='primary'")
-echo "  Ataque directo a S3 con credenciales de administrador (sin pasar por la app):"
-denied s3api delete-object --bucket "$BUCKET_PRIMARY" --key "$KEY" --version-id "$VP" && ok "S3: borrar la versión -> AccessDenied" || bad "S3 permitió borrar la versión"
-denied s3api delete-object --bucket "$BUCKET_PRIMARY" --key "$KEY" --version-id "$VP" --bypass-governance-retention && ok "S3: borrar con bypass-governance -> AccessDenied" || bad "S3 permitió bypass"
-denied s3api put-object-retention --bucket "$BUCKET_PRIMARY" --key "$KEY" --version-id "$VP" --retention "Mode=GOVERNANCE,RetainUntilDate=$(date -u -d '+1 minute' +%Y-%m-%dT%H:%M:%SZ)" && ok "S3: acortar/cambiar retención -> AccessDenied" || bad "S3 permitió cambiar la retención"
+echo "  Ataque directo a MinIO con credenciales de ADMINISTRADOR (sin pasar por la app):"
+denied rm --version-id "$VP" "pepi/$BUCKET_PRIMARY/$KEY" && ok "Almacenamiento: borrar la versión -> rechazado (WORM)" || bad "El almacenamiento permitió borrar la versión"
+denied rm --version-id "$VP" --bypass "pepi/$BUCKET_PRIMARY/$KEY" && ok "Almacenamiento: borrar con --bypass -> rechazado (WORM)" || bad "El almacenamiento permitió el bypass"
+denied retention set --version-id "$VP" governance 1d "pepi/$BUCKET_PRIMARY/$KEY" && ok "Almacenamiento: cambiar el modo de retención -> rechazado (WORM)" || bad "El almacenamiento permitió cambiar la retención"
 check "$(served "$ID" >/dev/null; sha256sum < "$TMP/dl.bin" | cut -d' ' -f1)" "$(sha256sum < "$TMP/informe.txt" | cut -d' ' -f1)" "El documento sigue disponible y sin modificaciones"
 
 h "9. Secretos fuera del código y de la imagen"
 IMG=$(docker compose images app --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | head -1); IMG=${IMG:-pepicloud-app:latest}
-for v in "$POSTGRES_PASSWORD" "$ENCRYPTION_KEY" "$ADMIN_TOKEN" "$PG_REPL_PASSWORD"; do
-  if grep -rqF -- "$v" app/lib app/app db localstack docker-compose.yml 2>/dev/null; then bad "Secreto encontrado en el código"; else ok "Secreto ausente del código fuente"; fi
+for v in "$POSTGRES_PASSWORD" "$ENCRYPTION_KEY" "$ADMIN_TOKEN" "$PG_REPL_PASSWORD" "$MINIO_ROOT_PASSWORD" "$S3_SECRET_KEY"; do
+  if grep -rqF -- "$v" app/lib app/app db minio docker-compose.yml 2>/dev/null; then bad "Secreto encontrado en el código"; else ok "Secreto ausente del código fuente"; fi
   if docker image inspect "$IMG" --format '{{json .Config.Env}}' | grep -qF -- "$v" || docker history --no-trunc "$IMG" | grep -qF -- "$v"; then bad "Secreto encontrado en la imagen"; else ok "Secreto ausente de la imagen ($IMG)"; fi
 done
 docker run --rm --entrypoint sh "$IMG" -c 'ls -a /app | grep -q "^.env" && echo SI || echo NO' | grep -q NO && ok "No hay archivo .env dentro de la imagen" || bad ".env dentro de la imagen"
